@@ -1,0 +1,7 @@
+# Direct dependencies, pinned to the versions verified on Python 3.14.8 (Windows).
+streamlit==1.66.1        # web UI
+pymupdf==2.0             # PDF text extraction with page numbers
+pydantic==2.14.1         # course schema and output validation
+anthropic==2.3.0         # LLM provider SDK (optional at runtime; demo mode works without a key)
+python-dotenv==1.2.4     # load settings from a local .env
+pytest==9.2.0            # tests

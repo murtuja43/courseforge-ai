@@ -1,0 +1,29 @@
+# Virtual environment
+.venv/
+venv/
+
+# Secrets (never commit real keys; use .env.example as the template)
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Python caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Generated and temporary files
+outputs/
+exports/
+*.tmp
+*.log
+~$*
+
+# OS / editor
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
