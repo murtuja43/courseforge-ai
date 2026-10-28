@@ -1,0 +1,13 @@
+[theme]
+primaryColor = "#047857"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F2F5F9"
+textColor = "#1E293B"
+font = "sans serif"
+
+[server]
+# Matches the 100 MB limit in courseforge/pdf_extract.py.
+maxUploadSize = 100
+
+[browser]
+gatherUsageStats = false

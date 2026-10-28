@@ -6,9 +6,11 @@ Team KayCode · Developer: Kayes Md Golam Murtuja · Track: AI for Education & L
 
 ## Status
 
-Early development. The environment is set up; the application itself is **not yet implemented, tested, or deployed**.
+MVP implemented and covered by automated tests (all offline; AI responses are mocked).
+The full workflow runs in offline demo mode. **The live AI path has not yet been tested
+against the real API**, and the app has not been deployed.
 
-## What it will do (MVP scope)
+## What it does
 
 A teacher uploads a textbook PDF, selects one chapter, and receives a draft mini-course:
 
@@ -29,7 +31,23 @@ pip install -r requirements.txt
 copy .env.example .env   # then add your API key and model id to .env
 ```
 
-Requires Python 3.14 (tested for installation only) or 3.12.
+Developed on Python 3.14; Python 3.12 is the fallback if a dependency will not install.
+
+## Run the app
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run app.py
+```
+
+Then open http://localhost:8501. No API key is needed to try it: click **Use the fictional
+sample textbook** and choose **Demo mode**. The sample textbook is generated in memory and
+its content is entirely invented.
+
+## Run the tests
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest tests -q
+```
 
 ## Configuration
 
