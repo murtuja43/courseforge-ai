@@ -40,6 +40,11 @@ All settings come from environment variables (or a local `.env` file); see `.env
 | `LLM_PROVIDER` | LLM provider (`anthropic`); empty means demo mode |
 | `ANTHROPIC_API_KEY` | Provider API key, never committed |
 | `COURSEFORGE_MODEL` | Model identifier; verified against the provider before use |
+| `COURSEFORGE_EFFORT` | Optional effort level (`low` to `max`); empty uses the model default |
+
+AI-generated courses are checked automatically: every source quotation must appear on its
+cited page. This confirms traceability to the textbook, not that every explanation is
+correct, so each course stays a draft until a teacher reviews it.
 
 ## Repository notes
 

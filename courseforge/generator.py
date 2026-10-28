@@ -109,10 +109,10 @@ def generate_demo_course(selection: Selection, source_filename: str, *,
                          document_page_count: int | None = None,
                          created_at: datetime | None = None) -> DemoResult:
     """Build a five-lesson draft course from the selected pages, without AI."""
-    _check_selection(selection, document_page_count)
+    check_selection(selection, document_page_count)
     sentences = extract_sentences(selection)
     if len(sentences) < MIN_SENTENCES:
-        raise InsufficientSourceError(_insufficient_message(selection, len(sentences)))
+        raise InsufficientSourceError(insufficient_source_message(selection, len(sentences)))
 
     groups = _split_into_lessons(sentences)
     vocabulary = _vocabulary(sentences)
@@ -145,7 +145,8 @@ def generate_demo_course(selection: Selection, source_filename: str, *,
     return DemoResult(course=course, citations=report, notices=notices)
 
 
-def _check_selection(selection: Selection, document_page_count: int | None) -> None:
+def check_selection(selection: Selection, document_page_count: int | None) -> None:
+    """Raise InvalidSelectionError unless the selection is a complete, valid page range."""
     start, end = selection.start_page, selection.end_page
     if start < 1 or end < start:
         raise InvalidSelectionError(f"Invalid page range {start}-{end}.")
@@ -165,7 +166,7 @@ def _check_selection(selection: Selection, document_page_count: int | None) -> N
             f"Extracted text is missing for pages {format_page_list(missing)} of the selection.")
 
 
-def _insufficient_message(selection: Selection, found: int) -> str:
+def insufficient_source_message(selection: Selection, found: int) -> str:
     if not selection.has_usable_text:
         reason = "The selected pages contain no extractable text"
         if any(p.status == PageStatus.LIKELY_SCANNED for p in selection.pages):
