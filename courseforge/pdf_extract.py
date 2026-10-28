@@ -13,6 +13,7 @@ boundaries are guessed.
 from __future__ import annotations
 
 import re
+import unicodedata
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -23,6 +24,9 @@ import pymupdf
 MIN_TEXT_CHARS = 25
 # Images covering at least this share of a low-text page suggest a scanned page.
 SCANNED_IMAGE_COVERAGE = 0.5
+# A section heading counts as starting partway down its page when at least this many
+# non-whitespace characters of text come before it on that page.
+MIN_CHARS_BEFORE_HEADING = 200
 DEFAULT_MAX_BYTES = 100 * 1024 * 1024
 
 
@@ -76,6 +80,7 @@ class Chapter:
     level: int
     start_page: int
     end_page: int
+    end_shared: bool = False  # the next section starts on end_page, so that page is shared
 
     @property
     def page_count(self) -> int:
@@ -113,6 +118,9 @@ class Selection:
     end_page: int
     pages: list[PageText]
     warnings: list[str] = field(default_factory=list)
+    # Table-of-contents sections that overlap the selected pages, with their own page
+    # ranges; empty when the PDF has no table of contents.
+    sections: list[Chapter] = field(default_factory=list)
 
     @property
     def text_pages(self) -> list[PageText]:
@@ -284,21 +292,57 @@ def parse_toc(raw_toc: list, page_count: int) -> tuple[list[TocEntry], list[str]
 def list_chapters(doc: ExtractedDocument, max_level: int | None = None) -> list[Chapter]:
     """Chapters and sections from the table of contents, with page ranges.
 
-    A section ends on the page before the next entry at the same or a higher level
-    starts, or on the last page of the document. Entries that start on the same page
-    share that page. Returns an empty list when there is no usable table of contents.
+    A section ends where the next entry at the same or a higher level starts, or on the
+    last page of the document. If that next entry starts on a later page, its start page
+    is included only when its heading is found partway down that page (with real text of
+    this section above it); otherwise the section ends on the page before. Entries that
+    start on the same page share that page. Returns an empty list when there is no usable
+    table of contents.
     """
     chapters = []
     for i, entry in enumerate(doc.toc):
         if max_level is not None and entry.level > max_level:
             continue
-        end = doc.page_count
+        end, shared = doc.page_count, False
         for nxt in doc.toc[i + 1:]:
             if nxt.level <= entry.level and nxt.page_number >= entry.page_number:
-                end = max(entry.page_number, nxt.page_number - 1)
+                if nxt.page_number == entry.page_number:
+                    end, shared = entry.page_number, True
+                elif heading_starts_mid_page(doc, nxt):
+                    end, shared = nxt.page_number, True
+                else:
+                    end = nxt.page_number - 1
                 break
-        chapters.append(Chapter(entry.title, entry.level, entry.page_number, end))
+        chapters.append(Chapter(entry.title, entry.level, entry.page_number, end, shared))
     return chapters
+
+
+def _heading_form(text: str) -> str:
+    return re.sub(r"[\W_]+", " ", unicodedata.normalize("NFKC", text).casefold()).strip()
+
+
+def heading_starts_mid_page(doc: ExtractedDocument, entry: TocEntry) -> bool:
+    """True if the entry's heading is found on its start page below real text.
+
+    The heading must occupy whole lines (it may span several, e.g. "9.7" then
+    "GAUSS-JORDAN"), so a title that merely appears inside a sentence does not count.
+    The first such match is used; running headers repeat the title later on the page.
+    """
+    page = doc.pages[entry.page_number - 1]
+    title = _heading_form(entry.title)
+    if not page.has_text or not title:
+        return False
+    lines = [_heading_form(line) for line in page.text.split("\n")]
+    for start in range(len(lines)):
+        joined = ""
+        for stop in range(start, len(lines)):
+            joined = f"{joined} {lines[stop]}".strip() if lines[stop] else joined
+            if joined == title:
+                before = sum(len(line.replace(" ", "")) for line in lines[:start])
+                return before >= MIN_CHARS_BEFORE_HEADING
+            if not title.startswith(joined):
+                break
+    return False
 
 
 def validate_page_range(start: int, end: int, page_count: int) -> None:
@@ -319,7 +363,9 @@ def select_page_range(doc: ExtractedDocument, start: int, end: int,
     pages = doc.pages[start - 1:end]
     if label is None:
         label = f"Page {start}" if start == end else f"Pages {start}-{end}"
-    selection = Selection(label=label, source=source, start_page=start, end_page=end, pages=pages)
+    sections = [c for c in list_chapters(doc) if c.start_page <= end and c.end_page >= start]
+    selection = Selection(label=label, source=source, start_page=start, end_page=end, pages=pages,
+                          sections=sections)
     skipped = [p.page_number for p in pages if not p.has_text]
     if not selection.has_usable_text:
         selection.warnings.append("The selected pages contain no extractable text.")

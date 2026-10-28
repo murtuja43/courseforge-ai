@@ -45,32 +45,63 @@ MAX_PROBLEMS_IN_FEEDBACK = 30
 REQUEST_TIMEOUT_SECONDS = 600.0
 SDK_MAX_RETRIES = 2              # the SDK retries 408/409/429/5xx and connection errors
 
-SYSTEM_PROMPT = f"""You help a teacher turn one textbook chapter into a {LESSON_COUNT}-lesson \
+TEACHER_CHECK = "Teacher check:"
+
+SYSTEM_PROMPT = f"""You help a teacher turn textbook pages into a {LESSON_COUNT}-lesson \
 mini-course. The teacher reviews everything before students see it.
 
-Write for students. Explain each concept clearly in plain language, building from simpler \
-ideas to harder ones. You may paraphrase and connect ideas, but every fact must come from \
-the source pages provided. Do not add facts, definitions, numbers, names or examples that \
-the source does not support. If the source does not cover something, leave it out.
+Teach, do not copy. Explain each concept in your own clear, student-friendly words, building \
+from simpler ideas to harder ones: say what the method is for, how it works step by step, \
+and when to use it. Do not string together sentences copied from the textbook; quotations \
+belong only in the source references. Every fact must come from the source pages provided. \
+Do not add facts, definitions, numbers, names or results that the source does not support.
 
-Course structure:
-- Exactly {LESSON_COUNT} lessons, numbered 1 to {LESSON_COUNT}, with distinct titles, \
-following the order of the source.
-- Each lesson has 2 to 4 specific learning objectives; a teaching explanation of a few \
-paragraphs; at least one example taken from the source; at least one practice activity \
-with a suggested answer; and 2 or 3 multiple-choice quiz questions.
-- Each quiz question has 4 options with ids A to D and exactly one correct option. Wrong \
-options must be plausible but clearly wrong according to the source. The explanation says \
-why the correct answer is right.
+Structure:
+- Exactly {LESSON_COUNT} lessons, numbered 1 to {LESSON_COUNT}, with distinct titles, in \
+the order of the source.
+- When a list of textbook sections is given, organize the lessons around it: a lesson \
+covers one section, or one coherent part of a longer section, and never mixes unrelated \
+sections. Give longer or harder sections more lessons. Text before the first listed \
+heading on a page may belong to the end of an earlier section; use it only as context.
+- Lesson titles name the concept taught (for example "Solving complex systems with real \
+arithmetic"), not page numbers.
+- Each lesson has 2 to 4 specific, measurable learning objectives; a teaching explanation \
+of a few paragraphs; at least one example; at least one practice activity with a \
+suggested answer; and 2 or 3 multiple-choice quiz questions.
+- Examples: when the source works through an example, present it step by step using the \
+source's own numbers. If the example is incomplete on these pages, or you work out steps \
+the source does not show, say so in the example, beginning that sentence with \
+"{TEACHER_CHECK}", so the teacher can verify it.
+- Quiz questions have 4 options with ids A to D and exactly one correct option. Wrong \
+options must be plausible but clearly wrong according to the source. Calculation questions \
+use values from the source; check the arithmetic so exactly one option is correct. The \
+explanation says why the correct answer is right.
 
-Source references are checked automatically, so follow these rules exactly:
-- Every lesson, example, practice activity and quiz question has at least one source reference.
-- "page" is the number in the page tag, for example <page number="41">. Cite only pages \
-you were given.
+Mathematics:
+- Equations are essential; teach them. Present clearly extracted equations with their \
+equation numbers and explain what each term means.
+- The page text was extracted from a PDF, and equations may be garbled: fractions split \
+across lines, matrices broken into single symbols, or symbols such as summation signs \
+missing. Never present your own reconstruction of a garbled equation as if it were the \
+textbook's equation. Refer to it by its number and page (for example "Eq. (9.36) on page \
+288"), explain it using the reliable surrounding prose, and add a sentence beginning \
+"{TEACHER_CHECK}" saying that the equation must be checked against the printed page.
+- If you write a mathematical expression yourself, for example to explain a step, label \
+it as an explanation rather than a quotation from the textbook.
+
+Source references:
+- Every lesson, example, practice activity and quiz question has at least one source \
+reference.
+- "page" is the physical PDF page number from the page tag, for example \
+<page number="286" printed="267"> means page 286. Never use the printed page number. Cite \
+only pages you were given.
 - "quote" is copied character for character from that one page: {MIN_QUOTE_CHARS} to \
 {MAX_QUOTE_CHARS} characters, one continuous passage, with no ellipses and no added or \
-changed words. It never spans two pages.
-- Choose a quote that directly supports the content it is attached to."""
+changed words. It never spans two pages. Prefer prose sentences, because garbled equation \
+text is not reliable to quote. Never invent a quotation.
+- Choose a quote that directly supports the content it is attached to.
+- You cannot verify citations. Never state that a quotation or source has been verified \
+or checked; CourseForge checks every quotation after you respond."""
 
 
 class LLMError(Exception):
@@ -224,9 +255,60 @@ def _output_schema() -> dict:
 
 
 def build_source_text(selection: Selection) -> str:
-    """The usable selected pages, each tagged with its physical PDF page number."""
-    return "\n\n".join(f'<page number="{p.page_number}">\n{p.text}\n</page>'
-                       for p in selection.text_pages)
+    """The usable selected pages, each tagged with its physical PDF page number.
+
+    The printed page label is added as a separate attribute when it differs, so the
+    model can see both but is told to cite only the physical number.
+    """
+    def tag(p) -> str:
+        printed = f' printed="{p.label}"' if p.label and p.label != str(p.page_number) else ""
+        return f'<page number="{p.page_number}"{printed}>\n{p.text}\n</page>'
+    return "\n\n".join(tag(p) for p in selection.text_pages)
+
+
+def build_section_context(selection: Selection) -> str:
+    """The PDF's own table-of-contents sections that overlap the selection."""
+    if not selection.sections:
+        return "The PDF has no table of contents for these pages, so no section list is available."
+    lines = ["Textbook sections overlapping these pages, from the PDF's table of contents "
+             "(physical PDF page numbers):"]
+    for s in selection.sections:
+        indent = "  " * (s.level - 1)
+        if s.start_page < selection.start_page:
+            where = f"began on page {s.start_page}, before the selected pages; continues here"
+        else:
+            where = f"starts on page {s.start_page}"
+        if s.end_page > selection.end_page:
+            where += "; continues after the selected pages"
+        elif s.end_shared and s.end_page <= selection.end_page:
+            where += f"; ends partway down page {s.end_page}"
+        lines.append(f"{indent}- {s.title} ({where})")
+    return "\n".join(lines)
+
+
+def teacher_check_locations(course: Course) -> list[str]:
+    """Where the model flagged something for the teacher to check."""
+    found = []
+    marker = TEACHER_CHECK.casefold()
+    for lesson in course.lessons:
+        where = f"Lesson {lesson.number}"
+        texts = [(where, lesson.explanation)]
+        texts += [(f"{where}, example {i}", e.explanation) for i, e in enumerate(lesson.examples, 1)]
+        texts += [(f"{where}, practice activity {i}", f"{a.prompt} {a.suggested_answer}")
+                  for i, a in enumerate(lesson.practice, 1)]
+        texts += [(f"{where}, quiz question {i}", f"{q.question} {q.explanation}")
+                  for i, q in enumerate(lesson.quiz, 1)]
+        found += [loc for loc, text in texts if marker in text.casefold()]
+    return found
+
+
+def _notices(selection: Selection, course: Course) -> list[str]:
+    notices = list(selection.warnings)
+    flagged = teacher_check_locations(course)
+    if flagged:
+        notices.append(f"The AI flagged {len(flagged)} item(s) for teacher checking (marked "
+                       f"\"{TEACHER_CHECK}\"): " + "; ".join(flagged) + ".")
+    return notices
 
 
 def generate_llm_course(selection: Selection, source_filename: str, *,
@@ -254,8 +336,9 @@ def generate_llm_course(selection: Selection, source_filename: str, *,
 
     messages: list[dict] = [{"role": "user", "content": [
         {"type": "text", "cache_control": {"type": "ephemeral"},  # reused by corrective retries
-         "text": (f"Chapter: {label}\nPhysical PDF pages {selection.start_page}-{selection.end_page}. "
-                  f"Pages without extractable text are left out.\n\n{source}")},
+         "text": (f"Selection: {label}\nPhysical PDF pages {selection.start_page}-{selection.end_page}. "
+                  f"Pages without extractable text are left out.\n\n"
+                  f"{build_section_context(selection)}\n\n{source}")},
         {"type": "text", "text": f"Create the {LESSON_COUNT}-lesson course from these pages."},
     ]}]
     usage = {"input_tokens": 0, "output_tokens": 0}
@@ -267,7 +350,7 @@ def generate_llm_course(selection: Selection, source_filename: str, *,
         course, report, problems = _evaluate(text, metadata, selection, document_page_count)
         log.info("AI course attempt %d of %d: %d problem(s)", attempt, max_attempts, len(problems))
         if course is not None and not problems:
-            return LLMResult(course, report, attempt, notices=list(selection.warnings), usage=usage)
+            return LLMResult(course, report, attempt, notices=_notices(selection, course), usage=usage)
         if course is not None:
             best = (course, report, problems)
         if attempt < max_attempts:
@@ -278,7 +361,7 @@ def generate_llm_course(selection: Selection, source_filename: str, *,
     if best is not None:
         course, report, remaining = best
         return LLMResult(course, report, max_attempts, problems=remaining,
-                         notices=list(selection.warnings), usage=usage)
+                         notices=_notices(selection, course), usage=usage)
     raise LLMOutputError(f"The AI model did not return a valid course after {max_attempts} "
                          "attempt(s). Try again, or use demo mode.", problems)
 

@@ -106,6 +106,10 @@ def normalize_text(text: str) -> str:
     text = re.sub(r"[“”„‟″]", '"', text)
     text = re.sub(r"[‐‑‒–—−]", "-", text)
     text = re.sub(r"(\w)-\s*\n\s*(\w)", r"\1\2", text)                  # word broken across lines
+    # A PDF line break cannot tell "algo-|rithms" (soft) from "Newton-|Raphson" (real hyphen),
+    # so hyphens between letters are dropped on both sides: "Newton-Raphson" then matches
+    # "Newton-\nRaphson" and "NewtonRaphson" alike.
+    text = re.sub(r"(?<=[^\W\d_])-(?=[^\W\d_])", "", text)
     text = re.sub(r"\s+", " ", text)
     return text.strip().casefold()
 

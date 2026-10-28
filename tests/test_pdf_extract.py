@@ -154,6 +154,102 @@ def test_invalid_toc_entries_are_dropped_with_a_warning():
                         "to a valid page."]
 
 
+# ---------------------------------------------------------------- section boundaries (fictional layout)
+
+PARAGRAPH = ("Lumen crystals store the light of the twin suns and release it slowly after dusk, "
+             "which keeps the valley warm through the long night of the planet Orvane. ")
+
+
+def make_wrapped_pdf(page_texts, toc, labels=None) -> bytes:
+    doc = pymupdf.open()
+    for text in page_texts:
+        doc.new_page().insert_textbox(pymupdf.Rect(60, 60, 540, 780), text, fontsize=10)
+    doc.set_toc(toc)
+    if labels:
+        doc.set_page_labels(labels)
+    return doc.tobytes()
+
+
+# Pages 1-3 of a fictional chapter laid out like a printed textbook: 4.2 starts partway down
+# page 1, 4.3 starts partway down page 3, and running headers repeat titles at page ends.
+SECTION_PAGES = [
+    "4.1\nCRYSTAL BASICS\n" + PARAGRAPH * 3 + "\n4.2\nCRYSTAL GROWTH\n" + PARAGRAPH + "\n4.2\nCRYSTAL GROWTH\n41",
+    PARAGRAPH * 4 + "\n42\nCRYSTALS OF ORVANE",
+    PARAGRAPH * 3 + "\n4.3\nCRYSTAL HARVESTING\n" + PARAGRAPH + "\n4.3\nCRYSTAL HARVESTING\n43",
+    "CHAPTER 5\nSKY RIVERS\n" + PARAGRAPH * 4,
+]
+SECTION_TOC = [[1, "CHAPTER 4: Crystals of Orvane", 1], [2, "4.1 Crystal Basics", 1],
+               [2, "4.2 Crystal Growth", 1], [2, "4.3 Crystal Harvesting", 3],
+               [1, "CHAPTER 5: Sky Rivers", 4]]
+
+
+def section_doc():
+    labels = [{"startpage": 0, "prefix": "", "style": "D", "firstpagenum": 41}]
+    return extract_pdf(make_wrapped_pdf(SECTION_PAGES, SECTION_TOC, labels))
+
+
+def test_section_extends_to_the_page_where_the_next_heading_starts_partway_down():
+    chapters = {c.title: c for c in list_chapters(section_doc())}
+    growth = chapters["4.2 Crystal Growth"]
+    assert (growth.start_page, growth.end_page, growth.end_shared) == (1, 3, True)
+
+
+def test_entries_starting_on_the_same_page_share_it():
+    basics = {c.title: c for c in list_chapters(section_doc())}["4.1 Crystal Basics"]
+    assert (basics.start_page, basics.end_page, basics.end_shared) == (1, 1, True)
+
+
+def test_section_ends_before_a_chapter_that_starts_on_a_fresh_page():
+    chapters = {c.title: c for c in list_chapters(section_doc())}
+    harvesting = chapters["4.3 Crystal Harvesting"]
+    assert (harvesting.start_page, harvesting.end_page, harvesting.end_shared) == (3, 3, False)
+    chapter4 = chapters["CHAPTER 4: Crystals of Orvane"]
+    assert (chapter4.start_page, chapter4.end_page, chapter4.end_shared) == (1, 3, False)
+
+
+def test_heading_that_cannot_be_found_keeps_the_page_before_rule():
+    toc = SECTION_TOC[:3] + [[2, "4.3 A Title That Is Not Printed", 3], SECTION_TOC[4]]
+    doc = extract_pdf(make_wrapped_pdf(SECTION_PAGES, toc))
+    growth = {c.title: c for c in list_chapters(doc)}["4.2 Crystal Growth"]
+    assert (growth.end_page, growth.end_shared) == (2, False)
+
+
+def test_title_inside_a_sentence_is_not_taken_as_a_heading():
+    pages = ["Intro text.\n" + PARAGRAPH * 2, PARAGRAPH * 3 + "\nThe Problems of harvesting are many.\n" + PARAGRAPH]
+    doc = extract_pdf(make_wrapped_pdf(pages, [[1, "Intro", 1], [1, "Problems", 2]]))
+    intro = list_chapters(doc)[0]
+    assert (intro.end_page, intro.end_shared) == (1, False)
+
+
+def test_heading_near_the_top_of_its_page_is_not_mid_page():
+    pages = [PARAGRAPH * 4, "42\nCRYSTALS\n4.9\nCRYSTAL DUST\n" + PARAGRAPH * 3]
+    doc = extract_pdf(make_wrapped_pdf(pages, [[1, "4.8 Crystal Light", 1], [1, "4.9 Crystal Dust", 2]]))
+    light = list_chapters(doc)[0]
+    assert (light.end_page, light.end_shared) == (1, False)
+
+
+def test_selection_carries_the_overlapping_sections_with_their_real_ranges():
+    doc = section_doc()
+    sel = select_page_range(doc, 2, 3)
+    assert [(s.title, s.start_page, s.end_page) for s in sel.sections] == [
+        ("CHAPTER 4: Crystals of Orvane", 1, 3), ("4.2 Crystal Growth", 1, 3), ("4.3 Crystal Harvesting", 3, 3)]
+    assert [p.page_number for p in sel.pages] == [2, 3]          # physical numbering is unchanged
+    assert [p.label for p in sel.pages] == ["42", "43"]           # printed labels stay separate
+
+
+def test_selection_without_a_toc_has_no_sections():
+    sel = select_page_range(extract_pdf(make_pdf([BODY] * 3)), 1, 3)
+    assert sel.sections == []
+
+
+def test_chapter_selection_covers_the_shared_page():
+    doc = section_doc()
+    growth = next(c for c in list_chapters(doc) if c.title == "4.2 Crystal Growth")
+    sel = select_chapter(doc, growth)
+    assert [p.page_number for p in sel.pages] == [1, 2, 3]
+    assert "4.2 Crystal Growth" in [s.title for s in sel.sections]
+
+
 # ---------------------------------------------------------------- page range selection
 
 def test_select_page_range():

@@ -1,6 +1,7 @@
 """Tests for citation validation in courseforge.validate."""
 
 import pymupdf
+import pytest
 
 from courseforge.pdf_extract import PageStatus, PageText, Selection, extract_pdf, select_page_range
 from courseforge.schema import Course
@@ -149,6 +150,54 @@ def test_empty_report_is_not_all_verified():
 def test_normalization_handles_pdf_text_artifacts():
     page_text = "The eﬃcient “leaf” pro-\ncess   runs\nduring  DAYLIGHT – mostly."
     assert normalize_text('efficient "leaf" process runs during daylight - mostly') in normalize_text(page_text)
+
+
+HYPHEN_PAGE = ("It should be noted that variations of the Newton-\nRaphson approach have been "
+               "developed, similar to the two-\nequation case. Gauss-Jordan is a variation of Gauss "
+               "elimination. One of the algo-\nrithms described in this part is up-front work.")
+
+
+def hyphen_course(quote):
+    return course_with(lesson_sources=[{"page": 1, "quote": quote}])
+
+
+def hyphen_selection():
+    return selection(1, 1, pages=[page(1, HYPHEN_PAGE)])
+
+
+@pytest.mark.parametrize("quote", [
+    "variations of the Newton-Raphson approach have been developed",   # real hyphen, broken line
+    "similar to the two-equation case",
+    "variations of the NewtonRaphson approach",                         # joined form still matches
+    "Gauss-Jordan is a variation of Gauss elimination.",                # hyphen within one line
+    "One of the algorithms described in this part",                     # soft line-break hyphen
+    "described in this part is up-front work.",
+])
+def test_hyphenated_terms_split_across_lines_are_verified(quote):
+    [check] = checks_at(check_citations(hyphen_course(quote), hyphen_selection()), "Lesson 1")
+    assert check.verified, check.message
+
+
+@pytest.mark.parametrize("quote", [
+    "variations of the Newton-Simpson approach",            # different word, not a hyphen variant
+    "similar to the three-equation case",
+    "Gauss-Jordan is a variation of LU decomposition.",
+])
+def test_hyphen_tolerance_does_not_accept_different_words(quote):
+    [check] = checks_at(check_citations(hyphen_course(quote), hyphen_selection()), "Lesson 1")
+    assert check.status == CitationStatus.QUOTE_NOT_FOUND
+
+
+def test_soft_hyphen_is_still_ignored():
+    page_text = "The e­limination step removes one unknown from each equation."
+    sel = selection(1, 1, pages=[page(1, page_text)])
+    report = check_citations(hyphen_course("The elimination step removes one unknown"), sel)
+    assert checks_at(report, "Lesson 1")[0].verified
+
+
+def test_hyphens_between_digits_are_kept():
+    assert normalize_text("pages 1-3") == "pages 1-3"
+    assert normalize_text("pages 1-3") != normalize_text("pages 13")
 
 
 def test_quote_matching_works_on_real_extracted_pdf_text():

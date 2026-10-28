@@ -177,6 +177,80 @@ def test_scanned_pages_are_not_sent_to_the_model():
     assert '<page number="5">' not in client.requests[0]["messages"][0]["content"][0]["text"]
 
 
+# ---------------------------------------------------------------- prompt content (fix E)
+
+def test_request_lists_the_selected_sections_with_physical_start_pages():
+    from courseforge.pdf_extract import select_page_range
+    from test_pdf_extract import section_doc
+    doc = section_doc()
+    sel = select_page_range(doc, 2, 3)
+    text = llm.build_section_context(sel)
+    assert "- CHAPTER 4: Crystals of Orvane (began on page 1, before the selected pages; continues here)" in text
+    assert "  - 4.2 Crystal Growth (began on page 1, before the selected pages; continues here; " \
+           "ends partway down page 3)" in text
+    assert "  - 4.3 Crystal Harvesting (starts on page 3)" in text
+
+
+def test_selection_without_sections_says_so():
+    _, sel = chapter_selection()
+    assert "no table of contents" in llm.build_section_context(sel)
+
+
+def test_page_tags_carry_printed_labels_separately():
+    from courseforge.pdf_extract import select_page_range
+    from test_pdf_extract import section_doc
+    source = llm.build_source_text(select_page_range(section_doc(), 2, 3))
+    assert '<page number="2" printed="42">' in source and '<page number="3" printed="43">' in source
+
+
+def test_section_context_is_sent_with_the_source_text():
+    from courseforge.pdf_extract import select_page_range
+    from test_pdf_extract import section_doc
+    doc = section_doc()
+    client = FakeClient("{not json", "{not json", "{not json")
+    with pytest.raises(LLMOutputError):
+        generate_llm_course(select_page_range(doc, 2, 3), "fiction.pdf", config=CONFIG, client=client)
+    text = client.requests[0]["messages"][0]["content"][0]["text"]
+    assert text.index("Textbook sections overlapping") < text.index('<page number="2" printed="42">')
+
+
+@pytest.mark.parametrize("rule", [
+    "Teach, do not copy",
+    "Do not string together sentences copied from the textbook",
+    "organize the lessons around it",
+    "never mixes unrelated sections",
+    "Equations are essential; teach them",
+    "Never present your own reconstruction of a garbled equation",
+    'add a sentence beginning "Teacher check:"',
+    "Never use the printed page number",
+    "Never invent a quotation",
+    "Never state that a quotation or source has been verified",
+    "check the arithmetic so exactly one option is correct",
+])
+def test_system_prompt_states_the_rule(rule):
+    assert rule in llm.SYSTEM_PROMPT
+
+
+def test_system_prompt_does_not_tell_the_model_to_skip_mathematics():
+    prompt = llm.SYSTEM_PROMPT.casefold()
+    for phrase in ("ignore equations", "avoid equations", "do not teach math", "avoid mathematics"):
+        assert phrase not in prompt
+
+
+def test_teacher_check_flags_become_a_notice():
+    flagged = json.loads(course_json())
+    flagged["lessons"][1]["explanation"] += " Teacher check: Eq. (9.36) is garbled in the extracted text."
+    flagged["lessons"][3]["examples"][0]["explanation"] += " Teacher check: steps 3-4 were worked out for this course."
+    result = run(FakeClient(json.dumps(flagged)))
+    assert result.verified
+    assert llm.teacher_check_locations(result.course) == ["Lesson 2", "Lesson 4, example 1"]
+    assert any("flagged 2 item(s) for teacher checking" in n for n in result.notices)
+
+
+def test_no_teacher_check_means_no_notice():
+    assert not any("teacher checking" in n for n in run(FakeClient(course_json())).notices)
+
+
 # ---------------------------------------------------------------- invalid output and retries
 
 def test_invalid_json_is_retried_with_feedback():
