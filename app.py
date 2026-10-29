@@ -121,6 +121,7 @@ with st.sidebar:
     st.subheader("AI configuration")
     (st.success if ai_ready else st.info)(ai_message)
     st.caption("Settings come from environment variables or a local .env file. The API key is never shown.")
+    st.caption(ui.FREE_TIER_NOTICE)
     st.divider()
     if st.button("Start over", key="start_over", width="stretch"):
         nonce = state.uploader_nonce + 1  # a new key also clears the uploaded file
@@ -205,11 +206,14 @@ st.caption("Page numbers are physical PDF pages (page 1 is the first page of the
 
 step("STEP 3  ·  CHOOSE HOW TO GENERATE")
 mode = st.radio("Generation mode", list(ui.MODES), format_func=ui.MODES.get, key="mode_choice")
-if mode == "demo" or (mode == "auto" and not ai_ready):
+if mode == "demo":
     st.info("Demo mode organizes the textbook's own sentences with fixed templates. It is useful for "
             "trying the workflow, but it does not write explanations like AI mode does.")
-if mode == "llm" and not ai_ready:
-    st.warning(f"AI mode is selected, but AI is not configured: {ai_message}")
+elif not ai_ready:
+    st.warning(f"AI is unavailable, so this mode cannot generate a course: {ai_message} "
+               "Choose Demo mode if you want an offline draft instead.")
+else:
+    st.caption(ui.FREE_TIER_NOTICE)
 
 # ---------------------------------------------------------------- 4. generate
 
@@ -223,7 +227,7 @@ if state.pending_mode:
     else:
         state.generating = True
         try:
-            spinner = ("Generating with AI. This can take a few minutes..." if run_mode != "demo"
+            spinner = ("Generating with Google Gemini. This can take a few minutes..." if run_mode != "demo"
                        else "Building the demo course...")
             with st.spinner(spinner):
                 outcome = ui.run_generation(gen_selection, doc, run_mode)
@@ -275,7 +279,7 @@ evaluation = ui.evaluate_course(edited, state.gen_selection, doc.page_count)
 course, report = evaluation.course, evaluation.report
 info = state.gen_info
 
-badges = [badge(f"AI-generated · {info['model']}", "ai") if info["mode"] == "llm"
+badges = [badge(f"AI-generated · Gemini · {info['model']}", "ai") if info["mode"] == "llm"
           else badge("Offline demo · no AI used", "demo")]
 approved = course is not None and state.approved_fp == ui.fingerprint(course)
 badges.append(badge("Approved by teacher", "approved") if approved else badge("Draft · not approved", "draft"))

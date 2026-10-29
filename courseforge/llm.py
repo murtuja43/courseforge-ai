@@ -1,16 +1,20 @@
-"""Live AI course generation through the Anthropic API, with an offline fallback.
+"""Live AI course generation through the Google Gemini API free tier.
 
 The model receives the selected pages tagged with their physical PDF page numbers and
 must return lessons as JSON matching the existing schema. Every response is checked by
 parse_course() and check_citations(); only the validator can mark a citation verified.
-Rejected output gets a limited number of corrective retries that list the exact
-problems. If citations still fail, the result is returned as an explicitly unverified
-draft. A verified citation shows that the quote appears on the cited page; it does not
-show that the AI explanation around it is correct.
+Rejected output gets corrective retries that list the exact problems, with a strict
+limit of MAX_ATTEMPTS generation calls in total. If citations still fail, the result is
+returned as an explicitly unverified draft. A verified citation shows that the quote
+appears on the cited page; it does not show that the AI explanation around it is correct.
 
-Configuration comes from environment variables (or a local .env file):
-LLM_PROVIDER, ANTHROPIC_API_KEY, COURSEFORGE_MODEL and optionally COURSEFORGE_EFFORT.
-The API key is never logged, printed or included in error messages.
+Only the Gemini free tier is supported. There is no paid or alternative provider and no
+automatic fallback: quota, rate-limit and other errors stop generation with a clear
+message, and demo mode is used only when the teacher chooses it.
+
+Configuration comes from environment variables (or a local .env file): LLM_PROVIDER
+(must be "gemini"), GEMINI_API_KEY and optionally COURSEFORGE_MODEL. The API key is
+never logged, printed or included in error messages.
 """
 
 from __future__ import annotations
@@ -21,11 +25,14 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
-from functools import lru_cache
 
-import anthropic
 from pydantic import BaseModel
 
+from courseforge.ai_errors import (  # noqa: F401  (re-exported for callers)
+    LLMAuthError, LLMConfigError, LLMConnectionError, LLMError, LLMOutputError, LLMRateLimitError,
+    LLMRequestError, LLMServiceError, LLMTimeoutError,
+)
+from courseforge.gemini import GeminiProvider, make_gemini_client
 from courseforge.generator import (
     DemoResult, InsufficientSourceError, check_selection, generate_demo_course,
     insufficient_source_message,
@@ -36,14 +43,15 @@ from courseforge.validate import TRACEABILITY_NOTE, CitationReport, check_citati
 
 log = logging.getLogger(__name__)
 
-SUPPORTED_PROVIDERS = ("anthropic",)
-EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
-MAX_ATTEMPTS = 3                 # one generation plus at most two corrective retries
-MAX_OUTPUT_TOKENS = 32_000
+SUPPORTED_PROVIDERS = ("gemini",)
+# Models confirmed (October 2026, ai.google.dev pricing and model pages) to be stable,
+# free of charge on the Gemini API free tier, and to support structured outputs.
+FREE_TIER_MODELS = ("gemini-3.8-flash",)
+DEFAULT_MODEL = "gemini-3.8-flash"
+MAX_ATTEMPTS = 3                 # total generation calls per course, corrective retries included
+MAX_OUTPUT_TOKENS = 32_768
 MAX_SOURCE_CHARS = 150_000       # roughly 40k tokens of chapter text
 MAX_PROBLEMS_IN_FEEDBACK = 30
-REQUEST_TIMEOUT_SECONDS = 600.0
-SDK_MAX_RETRIES = 2              # the SDK retries 408/409/429/5xx and connection errors
 
 TEACHER_CHECK = "Teacher check:"
 
@@ -104,54 +112,11 @@ text is not reliable to quote. Never invent a quotation.
 or checked; CourseForge checks every quotation after you respond."""
 
 
-class LLMError(Exception):
-    """AI generation failed. The message is safe to show to a teacher."""
-
-
-class LLMConfigError(LLMError):
-    """AI generation is not configured, or the configured model is not available."""
-
-
-class LLMAuthError(LLMError):
-    pass
-
-
-class LLMRateLimitError(LLMError):
-    def __init__(self, message: str, retry_after: str | None = None):
-        super().__init__(message)
-        self.retry_after = retry_after
-
-
-class LLMTimeoutError(LLMError):
-    pass
-
-
-class LLMConnectionError(LLMError):
-    pass
-
-
-class LLMRequestError(LLMError):
-    pass
-
-
-class LLMServiceError(LLMError):
-    pass
-
-
-class LLMOutputError(LLMError):
-    """The model did not produce an acceptable course."""
-
-    def __init__(self, message: str, problems: list[str] | None = None):
-        super().__init__(message)
-        self.problems = problems or []
-
-
 @dataclass(frozen=True)
 class LLMConfig:
     provider: str
     model: str
     api_key: str = field(repr=False)
-    effort: str | None = None
 
 
 class CourseDraft(BaseModel):
@@ -197,61 +162,28 @@ def load_config(env: Mapping[str, str] | None = None, *, use_dotenv: bool = True
     if not provider:
         raise LLMConfigError("AI generation is off because LLM_PROVIDER is not set.")
     if provider not in SUPPORTED_PROVIDERS:
-        raise LLMConfigError(f"LLM_PROVIDER '{provider}' is not supported; use "
-                             + " or ".join(SUPPORTED_PROVIDERS) + ".")
-    api_key = env.get("ANTHROPIC_API_KEY", "").strip()
+        raise LLMConfigError(f"LLM_PROVIDER '{provider}' is not supported. CourseForge uses only "
+                             "the Google Gemini free tier; set LLM_PROVIDER=gemini.")
+    api_key = env.get("GEMINI_API_KEY", "").strip()
     if not api_key:
-        raise LLMConfigError("AI generation is off because ANTHROPIC_API_KEY is not set.")
-    model = env.get("COURSEFORGE_MODEL", "").strip()
-    if not model:
-        raise LLMConfigError("AI generation is off because COURSEFORGE_MODEL is not set. "
-                             "Set it to a model your API key can access.")
-    effort = env.get("COURSEFORGE_EFFORT", "").strip().lower() or None
-    if effort and effort not in EFFORT_LEVELS:
-        raise LLMConfigError(f"COURSEFORGE_EFFORT '{effort}' is not valid; use one of "
-                             + ", ".join(EFFORT_LEVELS) + ", or leave it empty.")
-    return LLMConfig(provider=provider, model=model, api_key=api_key, effort=effort)
+        raise LLMConfigError("AI generation is off because GEMINI_API_KEY is not set.")
+    model = env.get("COURSEFORGE_MODEL", "").strip() or DEFAULT_MODEL
+    if model not in FREE_TIER_MODELS:
+        raise LLMConfigError(f"COURSEFORGE_MODEL '{model}' is not an approved Gemini free-tier "
+                             "model; use " + " or ".join(FREE_TIER_MODELS) + ", or leave it empty.")
+    return LLMConfig(provider=provider, model=model, api_key=api_key)
 
 
-def make_client(config: LLMConfig) -> anthropic.Anthropic:
-    return anthropic.Anthropic(api_key=config.api_key, timeout=REQUEST_TIMEOUT_SECONDS,
-                               max_retries=SDK_MAX_RETRIES)
+def make_client(config: LLMConfig):
+    """The Gemini SDK client for this configuration (tests replace this function)."""
+    return make_gemini_client(config.api_key)
 
 
-def verify_model(client, model: str) -> None:
-    """Check that the configured model exists for this key (no tokens are used)."""
-    try:
-        client.models.retrieve(model)
-    except anthropic.APIError as exc:
-        raise _translate(exc, model) from exc
-
-
-def _translate(exc: anthropic.APIError, model: str) -> LLMError:
-    if isinstance(exc, (anthropic.AuthenticationError, anthropic.PermissionDeniedError)):
-        return LLMAuthError("The AI service rejected the API key. Check ANTHROPIC_API_KEY.")
-    if isinstance(exc, anthropic.NotFoundError):
-        return LLMConfigError(f"The model '{model}' was not found or is not available to this "
-                              "API key. Check COURSEFORGE_MODEL.")
-    if isinstance(exc, anthropic.RateLimitError):
-        retry_after = exc.response.headers.get("retry-after")
-        wait = f" Try again in about {retry_after} seconds." if retry_after else " Try again later."
-        return LLMRateLimitError("The AI service rate limit was reached." + wait, retry_after)
-    if isinstance(exc, anthropic.APITimeoutError):
-        return LLMTimeoutError("The AI service did not respond in time. Try again, or select fewer pages.")
-    if isinstance(exc, anthropic.APIConnectionError):
-        return LLMConnectionError("Could not connect to the AI service. Check the internet connection.")
-    if isinstance(exc, anthropic.BadRequestError):
-        return LLMRequestError(f"The AI service rejected the request: {exc.message}")
-    if isinstance(exc, anthropic.APIStatusError):
-        return LLMServiceError(f"The AI service returned an error (HTTP {exc.status_code}). Try again later.")
-    return LLMError("The AI request failed.")
+def make_provider(config: LLMConfig, client=None) -> GeminiProvider:
+    return GeminiProvider(config.model, config.api_key, client if client is not None else make_client(config))
 
 
 # ---------------------------------------------------------------- generation
-
-@lru_cache(maxsize=1)
-def _output_schema() -> dict:
-    return anthropic.transform_schema(CourseDraft)
 
 
 def build_source_text(selection: Selection) -> str:
@@ -324,8 +256,9 @@ def generate_llm_course(selection: Selection, source_filename: str, *,
         raise LLMRequestError(f"The selected pages contain {len(source):,} characters of text; the "
                               f"limit is {MAX_SOURCE_CHARS:,}. Select a shorter chapter or page range.")
 
-    client = client or make_client(config)
-    verify_model(client, config.model)
+    max_attempts = min(max_attempts, MAX_ATTEMPTS)  # never more than the hard limit
+    provider = make_provider(config, client)
+    provider.verify_model()
 
     label = chapter_label or selection.label
     metadata = {"title": label, "source_filename": source_filename, "chapter_label": label,
@@ -334,19 +267,20 @@ def generate_llm_course(selection: Selection, source_filename: str, *,
     if created_at is not None:
         metadata["created_at"] = created_at
 
-    messages: list[dict] = [{"role": "user", "content": [
-        {"type": "text", "cache_control": {"type": "ephemeral"},  # reused by corrective retries
-         "text": (f"Selection: {label}\nPhysical PDF pages {selection.start_page}-{selection.end_page}. "
-                  f"Pages without extractable text are left out.\n\n"
-                  f"{build_section_context(selection)}\n\n{source}")},
-        {"type": "text", "text": f"Create the {LESSON_COUNT}-lesson course from these pages."},
-    ]}]
-    usage = {"input_tokens": 0, "output_tokens": 0}
+    turns: list[dict] = [{"role": "user", "text": (
+        f"Selection: {label}\nPhysical PDF pages {selection.start_page}-{selection.end_page}. "
+        f"Pages without extractable text are left out.\n\n"
+        f"{build_section_context(selection)}\n\n{source}\n\n"
+        f"Create the {LESSON_COUNT}-lesson course from these pages.")}]
+    usage = {"input_tokens": 0, "output_tokens": 0, "thinking_tokens": 0}
     best: tuple[Course, CitationReport, list[str]] | None = None
     problems: list[str] = []
 
     for attempt in range(1, max_attempts + 1):
-        text = _request(client, config, messages, usage)
+        reply = provider.generate(SYSTEM_PROMPT, turns, CourseDraft, MAX_OUTPUT_TOKENS)
+        for key, value in reply.usage.items():
+            usage[key] = usage.get(key, 0) + value
+        text = reply.text
         course, report, problems = _evaluate(text, metadata, selection, document_page_count)
         log.info("AI course attempt %d of %d: %d problem(s)", attempt, max_attempts, len(problems))
         if course is not None and not problems:
@@ -355,8 +289,8 @@ def generate_llm_course(selection: Selection, source_filename: str, *,
             best = (course, report, problems)
         if attempt < max_attempts:
             if text.strip():
-                messages.append({"role": "assistant", "content": text})
-            messages.append({"role": "user", "content": _feedback(problems)})
+                turns.append({"role": "model", "text": text})
+            turns.append({"role": "user", "text": _feedback(problems)})
 
     if best is not None:
         course, report, remaining = best
@@ -364,27 +298,6 @@ def generate_llm_course(selection: Selection, source_filename: str, *,
                          notices=_notices(selection, course), usage=usage)
     raise LLMOutputError(f"The AI model did not return a valid course after {max_attempts} "
                          "attempt(s). Try again, or use demo mode.", problems)
-
-
-def _request(client, config: LLMConfig, messages: list[dict], usage: dict[str, int]) -> str:
-    output_config: dict = {"format": {"type": "json_schema", "schema": _output_schema()}}
-    if config.effort:
-        output_config["effort"] = config.effort
-    try:
-        with client.messages.stream(model=config.model, max_tokens=MAX_OUTPUT_TOKENS,
-                                    system=SYSTEM_PROMPT, messages=list(messages),
-                                    output_config=output_config) as stream:
-            message = stream.get_final_message()
-    except anthropic.APIError as exc:
-        raise _translate(exc, config.model) from exc
-
-    for key in usage:
-        usage[key] += getattr(message.usage, key, 0) or 0
-    if message.stop_reason == "refusal":
-        raise LLMOutputError("The AI model declined to process these pages. Try demo mode.")
-    if message.stop_reason == "max_tokens":
-        raise LLMOutputError("The AI response was too long and was cut off. Select fewer pages.")
-    return "".join(block.text for block in message.content if block.type == "text")
 
 
 def _evaluate(text: str, metadata: dict, selection: Selection,
@@ -421,21 +334,15 @@ def _feedback(problems: list[str]) -> str:
 
 def generate_course(selection: Selection, source_filename: str, *, mode: str = "auto",
                     config: LLMConfig | None = None, client=None, **kwargs) -> DemoResult | LLMResult:
-    """Generate with AI when configured, otherwise with the offline demo generator.
+    """Generate a course in the chosen mode.
 
-    mode "auto" falls back to demo mode only when AI is not configured; runtime errors
-    such as rate limits are raised so the caller can decide (for example, offer demo mode).
+    "demo" runs the offline generator. "auto" and "llm" use Gemini and raise
+    LLMConfigError when it is not configured; no mode ever substitutes demo output for
+    an unavailable or failed AI request.
     """
     if mode == "demo":
         return generate_demo_course(selection, source_filename, **kwargs)
     if mode not in ("auto", "llm"):
         raise ValueError(f"Unknown generation mode: {mode!r}")
-    try:
-        config = config or load_config()
-    except LLMConfigError as exc:
-        if mode == "llm":
-            raise
-        result = generate_demo_course(selection, source_filename, **kwargs)
-        result.notices.insert(0, f"{exc} The offline demo generator was used instead.")
-        return result
+    config = config or load_config()
     return generate_llm_course(selection, source_filename, config=config, client=client, **kwargs)

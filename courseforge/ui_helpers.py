@@ -28,10 +28,15 @@ from courseforge.validate import (
 )
 
 MODES = {
-    "auto": "Auto: use AI when it is configured, otherwise the offline demo",
-    "llm": "AI mode: requires a configured API key and model",
+    "auto": "Auto: use Gemini when it is configured; otherwise explain that AI is unavailable",
+    "llm": "AI mode: Google Gemini free tier (requires GEMINI_API_KEY)",
     "demo": "Demo mode: offline, deterministic, no AI",
 }
+
+FREE_TIER_NOTICE = ("Gemini free tier: Google sets the quotas, and content sent on the free tier "
+                    "(including textbook pages) may be used by Google to improve its products. "
+                    "Use an API key from a Google Cloud project without billing; CourseForge "
+                    "cannot detect billing and never switches to a paid provider.")
 
 CITATION_LABELS = {
     CitationStatus.VERIFIED: "Verified",
@@ -53,7 +58,8 @@ def ai_status() -> tuple[bool, str]:
         config = load_config()
     except LLMConfigError as exc:
         return False, str(exc)
-    return True, f"AI is configured with the model {config.model} (checked with the provider when you generate)."
+    return True, (f"Google Gemini free tier is configured with the model {config.model} "
+                  "(checked with Google when you generate).")
 
 
 # ---------------------------------------------------------------- chapters
@@ -95,7 +101,7 @@ def run_generation(selection: Selection, doc: ExtractedDocument, mode: str, *,
     except LLMAuthError as exc:
         return GenerationOutcome(title="The API key was rejected", message=str(exc), offer_demo=True)
     except LLMRateLimitError as exc:
-        return GenerationOutcome(title="AI rate limit reached", message=str(exc), offer_demo=True)
+        return GenerationOutcome(title="Gemini free-tier limit reached", message=str(exc), offer_demo=True)
     except LLMOutputError as exc:
         return GenerationOutcome(title="The AI output could not be accepted", message=str(exc),
                                  details=exc.problems, offer_demo=True)
@@ -235,7 +241,7 @@ def citation_counts(report: CitationReport) -> dict[str, int]:
 def mode_label(course: Course) -> str:
     meta = course.metadata
     if meta.generation_mode == "llm":
-        return f"AI-generated (model: {meta.model})"
+        return f"AI-generated with Google Gemini (model: {meta.model})"
     return "Offline demo (assembled from the source text by fixed rules; no AI used)"
 
 

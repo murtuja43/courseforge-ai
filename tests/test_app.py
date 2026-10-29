@@ -4,17 +4,17 @@ import json
 import socket
 from pathlib import Path
 
-import anthropic
 import pytest
 from streamlit.testing.v1 import AppTest
 
 import courseforge.llm as llm
 from courseforge import ui_helpers as ui
 from courseforge.sample import CHAPTER_1, sample_pdf_bytes
-from test_llm import FakeClient, api_error, lesson
+from test_llm import QUOTA_DETAILS, FakeClient, api_error, lesson
 
 APP = str(Path(__file__).resolve().parent.parent / "app.py")
-AI_VARS = ("LLM_PROVIDER", "ANTHROPIC_API_KEY", "COURSEFORGE_MODEL", "COURSEFORGE_EFFORT")
+AI_VARS = ("LLM_PROVIDER", "GEMINI_API_KEY", "GOOGLE_API_KEY", "COURSEFORGE_MODEL")
+FAKE_KEY = "AIza-test-not-a-real-key"
 
 
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", None, ""}
@@ -25,8 +25,8 @@ def isolated(monkeypatch):
     """No outside network, no local .env, and AI unconfigured unless a test configures it.
 
     AppTest's event loop needs local loopback sockets, so instead of blocking sockets
-    outright, any lookup of a non-local host fails. A real API call must resolve
-    api.anthropic.com first, so it cannot get through.
+    outright, any lookup of a non-local host fails. A real Gemini call must resolve
+    generativelanguage.googleapis.com first, so it cannot get through.
     """
     real_getaddrinfo = socket.getaddrinfo
 
@@ -42,10 +42,9 @@ def isolated(monkeypatch):
 
 @pytest.fixture
 def configured_ai(monkeypatch):
-    """Configure AI with fake settings and route the client to a scripted fake."""
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-not-a-real-key")
-    monkeypatch.setenv("COURSEFORGE_MODEL", "test-model")
+    """Configure Gemini with a fake key and route the client to a scripted fake."""
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", FAKE_KEY)
     holder = {}
     monkeypatch.setattr(llm, "make_client", lambda config: holder["client"])
     return holder
@@ -71,9 +70,10 @@ def badges(at):
     return " ".join(m.value for m in at.markdown if 'class="cf-badge' in m.value)
 
 
-def test_network_guard_blocks_the_ai_service():
-    with pytest.raises(AssertionError, match="api.anthropic.com"):
-        socket.getaddrinfo("api.anthropic.com", 443)
+@pytest.mark.parametrize("host", ["generativelanguage.googleapis.com", "api.anthropic.com"])
+def test_network_guard_blocks_hosted_ai_services(host):
+    with pytest.raises(AssertionError, match=host):
+        socket.getaddrinfo(host, 443)
 
 
 # ---------------------------------------------------------------- start and upload
@@ -128,12 +128,15 @@ def test_demo_mode_generates_a_course_without_an_api_key():
     assert at.session_state.gen_info["mode"] == "demo"
 
 
-def test_auto_mode_without_ai_uses_demo_and_says_so():
+def test_auto_mode_without_ai_explains_and_does_not_build_a_demo_course():
     at = start()
     at.button(key="load_sample").click().run()
+    assert any("AI is unavailable" in w.value for w in at.warning)
     at.button(key="generate").click().run()  # "auto" is the default mode
+    assert at.session_state.course_data is None
+    assert any("AI is not available" in e.value and "LLM_PROVIDER is not set" in e.value for e in at.error)
+    at.button(key="switch_demo").click().run()  # demo only when explicitly chosen
     assert at.session_state.gen_info["mode"] == "demo"
-    assert "LLM_PROVIDER is not set" in at.session_state.gen_info["notices"][0]
 
 
 def test_second_click_does_not_replace_the_course_without_confirmation():
@@ -222,16 +225,30 @@ def test_ai_mode_without_configuration_offers_demo_but_does_not_switch():
     assert at.radio(key="mode_choice").value == "demo"
 
 
-def test_ai_rate_limit_is_reported_and_no_demo_course_is_substituted(configured_ai):
-    configured_ai["client"] = FakeClient(api_error(anthropic.RateLimitError, 429, {"retry-after": "15"}))
+def test_gemini_quota_error_is_reported_and_no_demo_course_is_substituted(configured_ai):
+    client = FakeClient(api_error(429, "RESOURCE_EXHAUSTED", "Quota exceeded", QUOTA_DETAILS))
+    configured_ai["client"] = client
     at = start()
     at.button(key="load_sample").click().run()
     at.radio(key="mode_choice").set_value("auto").run()
     at.button(key="generate").click().run()
     assert not at.exception
     assert at.session_state.course_data is None
-    assert any("AI rate limit reached" in e.value and "15 seconds" in e.value for e in at.error)
+    assert any("Gemini free-tier limit reached" in e.value and "37 seconds" in e.value
+               and "switch to another provider" in e.value for e in at.error)
+    assert len(client.requests) == 1
     assert at.button(key="switch_demo")
+
+
+def test_free_tier_notice_is_shown_when_gemini_is_configured(configured_ai):
+    configured_ai["client"] = FakeClient()
+    at = start()
+    at.button(key="load_sample").click().run()
+    notices = " ".join(c.value for c in at.caption)
+    assert "may be used by Google to improve its products" in notices
+    assert any("gemini-3.8-flash" in s.value for s in at.success)
+    page = " ".join(m.value for m in at.markdown) + notices + " ".join(s.value for s in at.success)
+    assert FAKE_KEY not in page
 
 
 def test_successful_ai_generation_is_labelled_as_ai(configured_ai):
@@ -244,5 +261,5 @@ def test_successful_ai_generation_is_labelled_as_ai(configured_ai):
     at.radio(key="mode_choice").set_value("llm").run()
     at.button(key="generate").click().run()
     assert not at.exception and not at.error
-    assert "AI-generated" in badges(at) and "test-model" in badges(at)
+    assert "AI-generated" in badges(at) and "gemini-3.8-flash" in badges(at)
     assert "citations verified" in badges(at) and "cf-ok" in badges(at)

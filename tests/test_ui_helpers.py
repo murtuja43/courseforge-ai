@@ -3,7 +3,6 @@
 import json
 import socket
 
-import anthropic
 import pytest
 
 from courseforge import ui_helpers as ui
@@ -13,7 +12,7 @@ from courseforge.pdf_extract import Chapter, PageStatus, PageText, Selection, ex
 from courseforge.sample import SAMPLE_FILENAME, sample_pdf_bytes
 from courseforge.validate import TRACEABILITY_NOTE, CitationStatus
 from test_generator import chapter_selection
-from test_llm import CONFIG, SECRET, FakeClient, api_error, course_json
+from test_llm import CONFIG, KEY_DETAILS, QUOTA_DETAILS, SECRET, FakeClient, api_error, course_json
 
 
 @pytest.fixture(autouse=True)
@@ -219,9 +218,9 @@ def test_demo_generation_succeeds_without_an_api_key():
 
 
 @pytest.mark.parametrize("error,title", [
-    (api_error(anthropic.AuthenticationError, 401), "The API key was rejected"),
-    (api_error(anthropic.RateLimitError, 429, {"retry-after": "20"}), "AI rate limit reached"),
-    (api_error(anthropic.InternalServerError, 500), "The AI request failed"),
+    (api_error(400, "INVALID_ARGUMENT", "API key not valid.", KEY_DETAILS), "The API key was rejected"),
+    (api_error(429, "RESOURCE_EXHAUSTED", "Quota exceeded", QUOTA_DETAILS), "Gemini free-tier limit reached"),
+    (api_error(503, "UNAVAILABLE", "The model is overloaded."), "The AI request failed"),
 ])
 def test_ai_failures_become_outcomes_that_offer_demo_mode(error, title):
     doc, sel = chapter_selection()
@@ -240,9 +239,18 @@ def test_invalid_ai_output_lists_problems():
 
 def test_unknown_model_is_reported_as_unavailable():
     doc, sel = chapter_selection()
-    client = FakeClient(model_error=api_error(anthropic.NotFoundError, 404))
+    client = FakeClient(model_error=api_error(404, "NOT_FOUND", "model not found"))
     outcome = ui.run_generation(sel, doc, "llm", config=CONFIG, client=client)
-    assert outcome.title == "AI is not available" and "test-model" in outcome.message
+    assert outcome.title == "AI is not available" and "gemini-3.8-flash" in outcome.message
+
+
+def test_auto_mode_without_ai_offers_demo_instead_of_using_it(monkeypatch):
+    monkeypatch.setattr("dotenv.load_dotenv", lambda **kwargs: False)
+    monkeypatch.delenv("LLM_PROVIDER", raising=False)
+    doc, sel = chapter_selection()
+    outcome = ui.run_generation(sel, doc, "auto")
+    assert not outcome.ok and outcome.result is None
+    assert outcome.title == "AI is not available" and outcome.offer_demo
 
 
 def test_insufficient_text_does_not_offer_demo_mode():
@@ -254,18 +262,24 @@ def test_insufficient_text_does_not_offer_demo_mode():
 def test_successful_ai_generation_with_a_mocked_client():
     doc, sel = chapter_selection()
     outcome = ui.run_generation(sel, doc, "llm", config=CONFIG, client=FakeClient(course_json()))
-    assert outcome.ok and ui.generation_info(outcome.result)["model"] == "test-model"
+    assert outcome.ok and ui.generation_info(outcome.result)["model"] == "gemini-3.8-flash"
 
 
 # ---------------------------------------------------------------- AI status
 
 def test_ai_status_never_shows_the_key(monkeypatch):
     monkeypatch.setattr("dotenv.load_dotenv", lambda **kwargs: False)
-    monkeypatch.setenv("LLM_PROVIDER", "anthropic")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", SECRET)
-    monkeypatch.setenv("COURSEFORGE_MODEL", "some-model")
+    monkeypatch.setenv("LLM_PROVIDER", "gemini")
+    monkeypatch.setenv("GEMINI_API_KEY", SECRET)
+    monkeypatch.delenv("COURSEFORGE_MODEL", raising=False)
     ready, message = ui.ai_status()
-    assert ready and "some-model" in message and SECRET not in message
+    assert ready and "gemini-3.8-flash" in message and "free tier" in message and SECRET not in message
+
+
+def test_free_tier_notice_states_quotas_and_data_use():
+    assert "Google sets the quotas" in ui.FREE_TIER_NOTICE
+    assert "may be used by Google to improve its products" in ui.FREE_TIER_NOTICE
+    assert "without billing" in ui.FREE_TIER_NOTICE
 
 
 def test_ai_status_when_not_configured(monkeypatch):
